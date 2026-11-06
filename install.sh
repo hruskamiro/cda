@@ -128,6 +128,11 @@ check_commands() {
   echo "Commands"
   command_status bash "Bash"
   command_status awk "awk"
+  if command -v flock >/dev/null 2>&1; then
+    report_ok "flock (recent directory tracking): $(command -v flock)"
+  else
+    report_warn "flock not found: recent tracking is unavailable; named aliases still work"
+  fi
 }
 
 check_shell_integration() {

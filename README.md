@@ -58,6 +58,7 @@ Run the dependency and shell integration check without changing anything:
 ## Usage
 
 ```bash
+cda --recent                # choose recent directories (default: 10)
 cda <alias>                 # change to a configured directory
 cda -a                      # add/update alias named after current directory
 cda -a <alias> [directory]  # add/update alias, directory defaults to $PWD
@@ -77,6 +78,22 @@ cda work
 cda -r
 cda -l
 ```
+
+## Recent directories
+
+Run `cda --recent` to choose from the last 10 unique locations saved across
+terminal sessions. Enter a number to jump there; Enter alone cancels. Requires
+`flock` for automatic tracking.
+
+To change the limit (1–10000), add this before the cda
+source line in `~/.bashrc`:
+
+```bash
+CDA_HISTORY_LIMIT=50
+```
+
+Reload `~/.bashrc` in every open terminal so they use the same limit. A smaller
+limit trims shared history; increasing it cannot restore discarded entries.
 
 ## Config
 

@@ -15,6 +15,7 @@ exit_or_return() {
 print_usage() {
   cat <<EOF
 Usage:
+  cda --recent                Choose from recent directories (default: 10)
   cda <alias>                 Change to directory mapped by <alias>
   cda -a                      Add/update alias named after current directory
   cda -a <alias> [directory]  Add/update alias (directory defaults to current)
@@ -26,6 +27,7 @@ Usage:
 
 Config:
   ${ALIASES_FILE}
+  CDA_HISTORY_LIMIT           Number of recent directories (default: 10; max: 10000)
 EOF
 }
 
@@ -178,7 +180,7 @@ _cda_completion() {
   local cur
   cur="${COMP_WORDS[COMP_CWORD]}"
 
-  local flags="-h --help -l --list -a -r -R --remove-all"
+  local flags="--recent -h --help -l --list -a -r -R --remove-all"
 
   if [[ $COMP_CWORD -eq 1 ]]; then
     COMPREPLY=($(compgen -W "$flags $(_cda_alias_names)" -- "$cur"))
@@ -211,6 +213,15 @@ cda() {
     echo "No arguments provided."
     print_usage
     return 1
+  fi
+
+  if [[ $1 == "--recent" ]]; then
+    if [[ $# -ne 1 ]]; then
+      echo "Usage: cda --recent" >&2
+      return 1
+    fi
+    _cda_choose_recent
+    return $?
   fi
 
   ensure_aliases_file
@@ -287,6 +298,134 @@ cda() {
     cd "$directory" || return 1
   fi
 }
+
+# NUL-separated records preserve spaces, tabs, newlines and backslashes.
+CDA_HISTORY_FILE="${CDA_HISTORY_FILE:-${XDG_STATE_HOME:-${HOME}/.local/state}/cda/recent}"
+if [[ "$CDA_HISTORY_FILE" != /* ]]; then
+  CDA_HISTORY_FILE="$PWD/$CDA_HISTORY_FILE"
+fi
+
+_cda_validate_history_limit() {
+  if [[ ! "$1" =~ ^[1-9][0-9]{0,4}$ ]] || ((10#$1 > 10000)); then
+    echo "cda: CDA_HISTORY_LIMIT must be an integer from 1 to 10000 (no leading zeros)." >&2
+    return 1
+  fi
+}
+
+_cda_check_history_file() {
+  local file=${1:-$CDA_HISTORY_FILE}
+  if [[ "$file" != /* ]]; then
+    echo "cda: set an absolute CDA_HISTORY_FILE, or set it before sourcing cda.sh." >&2
+    return 1
+  fi
+  if [[ -e "$file" && ! -f "$file" ]]; then
+    echo "cda: history path must be a regular file: $file" >&2
+    return 1
+  fi
+}
+
+_cda_save_directory() (
+  umask 077
+  local directory=$1 entry tmp_file limit=${CDA_HISTORY_LIMIT-10}
+  local -a directories=("$directory")
+
+  _cda_validate_history_limit "$limit" || return 1
+  _cda_check_history_file || return 1
+  _cda_check_history_file "${CDA_HISTORY_FILE}.lock" || return 1
+  command -v flock >/dev/null 2>&1 || {
+    echo "cda: recent directory tracking requires flock." >&2
+    return 1
+  }
+  mkdir -p -- "$(dirname -- "$CDA_HISTORY_FILE")" || return 1
+  # A separate, stable lock file protects the atomic replacement below.
+  exec 9>>"${CDA_HISTORY_FILE}.lock" || return 1
+  flock -x -w 2 9 || {
+    echo "cda: could not lock recent directory history." >&2
+    return 1
+  }
+  if [[ -f "$CDA_HISTORY_FILE" ]]; then
+    while [[ ${#directories[@]} -lt $limit ]] && IFS= read -r -d '' entry; do
+      [[ "$entry" != "$directory" && -d "$entry" ]] || continue
+      directories+=("$entry")
+    done < "$CDA_HISTORY_FILE" || return 1
+  fi
+  tmp_file=$(mktemp "${CDA_HISTORY_FILE}.XXXXXX") || return 1
+  trap 'rm -f -- "$tmp_file"' EXIT
+  printf '%s\0' "${directories[@]}" >| "$tmp_file" || return 1
+  mv -f -- "$tmp_file" "$CDA_HISTORY_FILE"
+)
+
+_cda_record_prompt() {
+  if [[ ${_CDA_LAST_DIRECTORY-} != "$PWD" && -d "$PWD" ]]; then
+    if _cda_save_directory "$PWD"; then
+      _CDA_LAST_DIRECTORY=$PWD
+    else
+      echo "cda: directory history was not saved." >&2
+    fi
+  fi
+  # Existing prompt commands run first; avoid firing ERR for their status.
+  return 0
+}
+
+_cda_choose_recent() {
+  local entry choice index limit=${CDA_HISTORY_LIMIT-10}
+  local -a directories=()
+  _cda_validate_history_limit "$limit" || return 1
+  _cda_check_history_file || return 1
+  if [[ -f "$CDA_HISTORY_FILE" ]]; then
+    while [[ ${#directories[@]} -lt $limit ]] && IFS= read -r -d '' entry; do
+      [[ -d "$entry" ]] || continue
+      directories+=("$entry")
+    done < "$CDA_HISTORY_FILE" || return 1
+  fi
+  if [[ ${#directories[@]} -eq 0 ]]; then
+    echo "No recent directories yet. Visit a directory in an interactive Bash shell."
+    return 0
+  fi
+  for ((index = 0; index < ${#directories[@]}; index++)); do
+    printf '%2d) %q\n' "$((index + 1))" "${directories[index]}"
+  done
+  IFS= read -r -p "Directory number (Enter to cancel): " choice || return 0
+  [[ -n "$choice" ]] || return 0
+  # Limit input length before arithmetic to avoid overflow and expressions.
+  if [[ ! "$choice" =~ ^[0-9]{1,5}$ ]] ||
+     ((10#$choice < 1 || 10#$choice > ${#directories[@]})); then
+    echo "Invalid directory number." >&2
+    return 1
+  fi
+  builtin cd -- "${directories[10#$choice - 1]}"
+}
+
+_cda_install_prompt_hook() {
+  local entry command declaration
+  local -a commands=()
+  declaration=$(declare -p PROMPT_COMMAND 2>/dev/null) || declaration=
+  if [[ $declaration =~ ^declare\ -[^[:space:]]*r ]]; then
+    echo "cda: PROMPT_COMMAND is readonly; prompt integration was left unchanged." >&2
+    return 0
+  fi
+  if [[ $declaration =~ ^declare\ -[^[:space:]]*a[^[:space:]]*\  ]]; then
+    for entry in "${PROMPT_COMMAND[@]}"; do
+      [[ "$entry" == '_cda_record_prompt' ]] || commands+=("$entry")
+    done
+    PROMPT_COMMAND=("${commands[@]}" _cda_record_prompt)
+  else
+    # Also migrate the prepended hook from earlier versions when re-sourcing.
+    command=${PROMPT_COMMAND-}
+    command=${command#_cda_record_prompt;}
+    if [[ "$command" == '_cda_record_prompt' ]]; then
+      command=
+    else
+      command=${command%$'\n_cda_record_prompt'}
+    fi
+    # A newline keeps the hook outside any trailing shell comment.
+    PROMPT_COMMAND="${command}${command:+$'\n'}_cda_record_prompt"
+  fi
+}
+
+if [[ $- == *i* ]]; then
+  _cda_install_prompt_hook
+fi
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   cda "$@"
